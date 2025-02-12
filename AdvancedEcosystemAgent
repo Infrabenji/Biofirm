@@ -1,0 +1,428 @@
+import numpy as np
+import logging
+import time
+import random
+from typing import Dict, Optional, List, Any, Union
+
+# =============================================================================
+# Setup and Utility Functions
+# =============================================================================
+
+def setup_logging(name: str) -> logging.Logger:
+    logging.basicConfig(level=logging.DEBUG)
+    return logging.getLogger(name)
+
+def convert_to_obj_array(mat: np.ndarray) -> np.ndarray:
+    # For our purposes, simply return the matrix.
+    return mat
+
+# =============================================================================
+# POMDP Matrix Initialization
+# =============================================================================
+
+class POMDPMatrices:
+    def __init__(self, matrix_config: Dict[str, Any], logger: logging.Logger):
+        self.matrix_config = matrix_config
+        self.logger = logger
+
+    def initialize_all_matrices(self) -> Dict[str, np.ndarray]:
+        # For a 3-state system:
+        obs_conf = self.matrix_config.get("observation_confidence", 0.9)
+        homeo_pref = self.matrix_config.get("homeostatic_preference", 4.0)
+        
+        # A: observation likelihood matrix
+        A = np.eye(3) * obs_conf
+        noise = (1 - obs_conf) / 2
+        A[0, 1] = noise; A[1, 0] = noise; A[1, 2] = noise; A[2, 1] = noise
+        A[0, 2] = noise; A[2, 0] = noise
+        
+        # B: state transition matrix (3x3x3)
+        B = np.zeros((3, 3, 3))
+        for a in range(3):
+            B[:, :, a] = np.eye(3)
+        
+        # C: preference vector (normalize)
+        C = np.array([0.1, homeo_pref, 0.1])
+        C = C / np.sum(C)
+        
+        # D: prior beliefs (normalized)
+        D = np.array([0.33, 0.34, 0.33])
+        return {'A': A, 'B': B, 'C': C, 'D': D}
+
+# =============================================================================
+# PyMDPAgent (Simulated Active Inference Agent)
+# =============================================================================
+
+class PyMDPAgent:
+    def __init__(self, A: np.ndarray, B: np.ndarray, C: np.ndarray, D: np.ndarray,
+                 control_fac_idx: List[int], inference_algo: str, action_selection: str):
+        # Store the matrices.
+        self.A = A
+        self.B = B
+        self.C = C
+        self.D = D
+        self.control_fac_idx = control_fac_idx
+        self.inference_algo = inference_algo
+        self.action_selection = action_selection
+        # Initialize beliefs with the prior.
+        self.qs = [D.copy()]
+    
+    def infer_states(self, observations: List[np.ndarray]) -> None:
+        # For this dummy implementation, simply average current belief with the observation.
+        obs = observations[0].flatten()
+        self.qs[0] = 0.5 * self.qs[0] + 0.5 * obs
+        # Normalize to sum to 1.
+        if np.sum(self.qs[0]) != 0:
+            self.qs[0] = self.qs[0] / np.sum(self.qs[0])
+    
+    def infer_policies(self) -> None:
+        # Dummy: do nothing.
+        pass
+    
+    def sample_action(self) -> np.ndarray:
+        # Return a random action in {0, 1, 2}.
+        return np.array([random.randint(0, 2)])
+
+# =============================================================================
+# Base Agent: BiofirmAgent
+# =============================================================================
+
+class BiofirmAgent:
+    """
+    Active inference agent bundle for ecosystem control.
+    Creates independent POMDP agents (one per controllable ecological modality).
+    Each agent receives discrete observations, updates its beliefs,
+    infers policies, and outputs a control signal (-1, 0, +1 scaled by control strength).
+    """
+    
+    def __init__(self, config: Dict[str, Any], logger: Optional[logging.Logger] = None) -> None:
+        self.logger = logger or setup_logging('biofirm_agent')
+        self.config = config
+        self.controllable_vars = list(config['variables'].keys())
+        self.agents = {}
+        self.logger.info(f"Initializing Active Inference Agents for {len(self.controllable_vars)} modalities.")
+        
+        try:
+            matrix_handler = POMDPMatrices({
+                'observation_confidence': 0.90,
+                'homeostatic_preference': 4.0
+            }, self.logger)
+            matrices = matrix_handler.initialize_all_matrices()
+            
+            A = matrices['A']
+            B = matrices['B']
+            C = matrices['C']
+            D = matrices['D']
+            
+            self.logger.debug(f"Matrices initialized: A{A.shape}, B{B.shape}, C{C.shape}, D{D.shape}")
+            
+            for var_name, var_config in self.config['variables'].items():
+                try:
+                    A_obs = convert_to_obj_array(A)
+                    B_transitions = convert_to_obj_array(B)
+                    C_prefs = convert_to_obj_array(C)
+                    D_prior = convert_to_obj_array(D)
+                    
+                    self.logger.debug(f"Initializing agent for modality '{var_name}'.")
+                    
+                    agent = PyMDPAgent(
+                        A=A_obs,
+                        B=B_transitions,
+                        C=C_prefs,
+                        D=D_prior,
+                        control_fac_idx=[0],
+                        inference_algo='MMP',
+                        action_selection='stochastic'
+                    )
+                    
+                    self.agents[var_name] = {
+                        'agent': agent,
+                        'control_strength': float(var_config['control_strength'])
+                    }
+                    
+                    self.logger.info(f"Created agent for '{var_name}' with control strength {var_config['control_strength']:.2f}.")
+                except Exception as e:
+                    self.logger.error(f"Error creating agent for '{var_name}': {str(e)}")
+                    raise
+        except Exception as e:
+            self.logger.error(f"Error in BiofirmAgent initialization: {str(e)}")
+            raise
+
+    def get_action(self, observations: Dict[str, int]) -> Dict[str, float]:
+        """
+        For each modality, update beliefs from the observation, infer policies, sample an action,
+        and convert the discrete action into a control signal.
+        """
+        controls = {}
+        try:
+            for var_name, agent_data in self.agents.items():
+                try:
+                    agent = agent_data['agent']
+                    obs_idx = observations[var_name]
+                    
+                    obs_array = np.zeros((1, 3))
+                    obs_array[0, obs_idx] = 1.0
+                    
+                    agent.infer_states([obs_array])
+                    agent.infer_policies()
+                    action = agent.sample_action()
+                    
+                    control = (action[0] - 1.0)  # Map {0,1,2} to {-1,0,1}
+                    control_strength = agent_data['control_strength']
+                    controls[var_name] = control * control_strength
+                    
+                    self.logger.debug(f"{var_name}: obs index {obs_idx}, action {action[0]}, control {controls[var_name]:+.2f}")
+                except Exception as e:
+                    self.logger.error(f"Error processing '{var_name}': {e}")
+                    controls[var_name] = 0.0
+            return controls
+        except Exception as e:
+            self.logger.error(f"Error in get_action: {e}")
+            return {}
+
+# =============================================================================
+# CollaborativeBiofirmAgent
+# =============================================================================
+
+class CollaborativeBiofirmAgent(BiofirmAgent):
+    """
+    Extends BiofirmAgent with multi-agent support and dynamic state propagation.
+    Uses a Markov matrix to propagate its internal belief state and supports peer communication.
+    """
+    
+    def __init__(self, config: Dict[str, Any], logger: Optional[logging.Logger] = None) -> None:
+        super().__init__(config, logger)
+        self.communication_threshold = config.get('communication_threshold', 3)
+        self.failure_counts = {var: 0 for var in self.controllable_vars}
+        self.last_decisions = {var: None for var in self.controllable_vars}
+        self.markov_matrix = config.get(
+            "markov_matrix",
+            np.array([[0.90, 0.05, 0.05],
+                      [0.05, 0.90, 0.05],
+                      [0.05, 0.05, 0.90]])
+        )
+    
+    def propagate_beliefs_with_markov(self, agent: PyMDPAgent) -> None:
+        """
+        Multiply the current belief vector by the Markov matrix and renormalize.
+        """
+        try:
+            q_current = np.array(agent.qs[0], dtype=float).flatten()
+            q_updated = self.markov_matrix @ q_current
+            if np.sum(q_updated) != 0:
+                q_updated = q_updated / np.sum(q_updated)
+            agent.qs[0] = q_updated.copy()
+            self.logger.debug(f"Beliefs after Markov propagation: {q_updated}")
+        except Exception as e:
+            self.logger.error(f"Error propagating beliefs: {e}")
+    
+    def communicate_with_other_agents(self, var: str,
+                                      other_agents: List['CollaborativeBiofirmAgent'],
+                                      failures: int) -> Optional[float]:
+        self.logger.info(f"Agent {self.get_id()} for '{var}' encountered {failures} uncertain decisions. Seeking peer input.")
+        for agent in other_agents:
+            if agent.get_id() != self.get_id():
+                candidate = agent.get_last_decision(var)
+                if candidate is not None and candidate != 0.0:
+                    self.logger.info(f"Peer agent {agent.get_id()} provided decision {candidate} for '{var}'.")
+                    return candidate
+        return None
+
+    def get_last_decision(self, var: str) -> Optional[float]:
+        return self.last_decisions.get(var)
+    
+    def get_id(self) -> int:
+        return id(self)
+    
+    def get_action(self, observations: Dict[str, int],
+                   other_agents: Optional[List['CollaborativeBiofirmAgent']] = None) -> Dict[str, float]:
+        new_controls = {}
+        for var, agent_data in self.agents.items():
+            try:
+                agent = agent_data['agent']
+                obs_idx = observations[var]
+                obs_array = np.zeros((1, 3))
+                obs_array[0, obs_idx] = 1.0
+                
+                agent.infer_states([obs_array])
+                self.propagate_beliefs_with_markov(agent)
+                agent.infer_policies()
+                action = agent.sample_action()
+                
+                control = (action[0] - 1.0)
+                control_strength = agent_data['control_strength']
+                new_controls[var] = control * control_strength
+                self.last_decisions[var] = new_controls[var]
+                
+                if new_controls[var] == 0.0:
+                    self.failure_counts[var] += 1
+                    if self.failure_counts[var] >= self.communication_threshold and other_agents:
+                        external_decision = self.communicate_with_other_agents(var, other_agents, self.failure_counts[var])
+                        if external_decision is not None:
+                            new_controls[var] = external_decision
+                            self.logger.info(f"Updated decision for '{var}' from peer input: {external_decision}")
+                            self.failure_counts[var] = 0
+                else:
+                    self.failure_counts[var] = 0
+            except Exception as e:
+                self.logger.error(f"Error processing '{var}' in get_action: {e}")
+                new_controls[var] = 0.0
+        return new_controls
+
+# =============================================================================
+# Cognitive Modules
+# =============================================================================
+
+class BeliefModulator:
+    """Modulates the belief vector slightly toward a uniform distribution."""
+    def __call__(self, beliefs: np.ndarray, context: Dict, performance_state: Dict) -> np.ndarray:
+        # For a simple modulation, move 10% toward a uniform target.
+        target = np.ones_like(beliefs) / len(beliefs)
+        return beliefs + 0.1 * (target - beliefs)
+
+class SimilarityCalculator:
+    """Calculates similarity between embeddings using cosine similarity."""
+    def __init__(self, feature_dim: int = 256):
+        self.feature_dim = feature_dim
+        
+    def calculate(self, source: Union[np.ndarray, Dict], target: Union[np.ndarray, Dict]) -> Dict:
+        # Convert inputs to numpy arrays.
+        if isinstance(source, dict):
+            source_array = source.get('features', np.zeros(self.feature_dim))
+        else:
+            source_array = source
+        if isinstance(target, dict):
+            target_array = target.get('features', np.zeros(self.feature_dim))
+        else:
+            target_array = target
+            
+        dot = np.dot(source_array, target_array)
+        norm_src = np.linalg.norm(source_array)
+        norm_tgt = np.linalg.norm(target_array)
+        cosine_sim = dot / (norm_src * norm_tgt) if norm_src and norm_tgt else 0.0
+        return {'weighted_score': cosine_sim}
+
+class CognitiveStateTracker:
+    """Tracks and updates internal cognitive state parameters."""
+    def __init__(self, initial_state: Dict):
+        self.state = initial_state.copy()
+    
+    def update(self, new_info: Dict) -> None:
+        self.state.update(new_info)
+        logging.getLogger(__name__).debug(f"CognitiveStateTracker updated: {self.state}")
+
+# =============================================================================
+# Advanced Agent: AdvancedEcosystemControlAgent
+# =============================================================================
+
+class AdvancedEcosystemControlAgent(CollaborativeBiofirmAgent):
+    """
+    An advanced ecosystem control agent that integrates extra cognitive processing.
+    It modulates its internal belief state using a BeliefModulator and adjusts its control signal
+    based on the similarity (cosine similarity) between the modulated belief and a target homeostatic embedding.
+    """
+    
+    def __init__(self, config: Dict[str, Any], logger: Optional[logging.Logger] = None) -> None:
+        super().__init__(config, logger)
+        self.belief_modulator = BeliefModulator()
+        self.similarity_calculator = SimilarityCalculator(feature_dim=256)
+        self.state_tracker = CognitiveStateTracker(initial_state={
+            'attention_level': 0.5,
+            'focus_intensity': 0.5,
+            'processing_clarity': 1.0,
+            'working_memory_load': 0.0,
+            'cognitive_load': 0.0
+        })
+        # For a 3-state model, we use a target embedding with a slight homeostatic bias.
+        self.target_embedding = np.array([0.33, 0.34, 0.33])
+    
+    def get_action(self, observations: Dict[str, int],
+                   other_agents: Optional[List['AdvancedEcosystemControlAgent']] = None) -> Dict[str, float]:
+        # Get basic control signals.
+        controls = super().get_action(observations, other_agents)
+        
+        # For each modality, modulate the belief and adjust the control signal.
+        for var, agent_data in self.agents.items():
+            try:
+                agent = agent_data['agent']
+                current_beliefs = np.array(agent.qs[0], dtype=float).flatten()
+                
+                # Apply belief modulation.
+                modulated_beliefs = self.belief_modulator(current_beliefs, context={}, performance_state={})
+                agent.qs[0] = modulated_beliefs.copy()
+                
+                # Compute similarity to the target embedding.
+                similarity_result = self.similarity_calculator.calculate(modulated_beliefs, self.target_embedding)
+                weighted_similarity = similarity_result.get('weighted_score', 0.0)
+                
+                original_control = controls[var]
+                # Scale control signal down if similarity is high.
+                adjusted_control = original_control * (1.0 - weighted_similarity)
+                controls[var] = adjusted_control
+                
+                self.logger.debug(
+                    f"Modality '{var}': orig control {original_control:.3f}, similarity {weighted_similarity:.3f}, "
+                    f"adjusted control {adjusted_control:.3f}"
+                )
+            except Exception as e:
+                self.logger.error(f"Error modulating beliefs for '{var}': {e}")
+                controls[var] = controls.get(var, 0.0)
+        
+        try:
+            # Update the cognitive state tracker with all agents' beliefs.
+            all_beliefs = [data['agent'].qs[0] for data in self.agents.values()]
+            self.state_tracker.update({'beliefs': all_beliefs})
+        except Exception as e:
+            self.logger.error(f"Error updating cognitive state tracker: {e}")
+        
+        return controls
+
+# =============================================================================
+# Factory: AgentFactory
+# =============================================================================
+
+class AgentFactory:
+    """
+    Factory model to instantiate ecosystem control agents.
+    Supported types: "basic", "collaborative", "advanced".
+    """
+    
+    @staticmethod
+    def create_agent(agent_type: str, config: Dict[str, Any],
+                     logger: Optional[logging.Logger] = None) -> Any:
+        agent_type = agent_type.lower()
+        if agent_type == "basic":
+            return BiofirmAgent(config, logger)
+        elif agent_type == "collaborative":
+            return CollaborativeBiofirmAgent(config, logger)
+        elif agent_type == "advanced":
+            return AdvancedEcosystemControlAgent(config, logger)
+        else:
+            raise ValueError(f"Unknown agent type: {agent_type}")
+
+# =============================================================================
+# Test for the Model
+# =============================================================================
+
+if __name__ == "__main__":
+    # Example configuration dictionary.
+    config = {
+        "variables": {
+            "nutrient_level": {"control_strength": 0.8},
+            "population_density": {"control_strength": 1.2}
+        },
+        "communication_threshold": 3,
+        "markov_matrix": np.array([[0.90, 0.05, 0.05],
+                                   [0.05, 0.90, 0.05],
+                                   [0.05, 0.05, 0.90]])
+    }
+    
+    # Create an advanced ecosystem control agent using the factory.
+    agent = AgentFactory.create_agent("advanced", config)
+    
+    # Example observation: for each modality, an integer in {0,1,2} (0 = LOW, 1 = HOMEOSTATIC, 2 = HIGH)
+    observations = {"nutrient_level": 1, "population_density": 2}
+    
+    # Get control signals.
+    control_signals = agent.get_action(observations)
+    print("Control Signals:", control_signals)
